@@ -168,7 +168,7 @@ handleRequest
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	// todo: 应调用相应rpc方法，获取replyV，暂时只print参数
 	defer wg.Done()
-	log.Println(req.header, req.argV.Elem())
+	log.Println("handleRequest header: ", req.header, req.argV.Elem())
 	req.replyV = reflect.ValueOf(fmt.Sprintf("myGoRPC response %d", req.header.Seq))
 	server.sendResponse(cc, req.header, req.replyV.Interface(), sending)
 }

@@ -1,3 +1,18 @@
+- [myGoRPC](#mygorpc)
+- [RPC简介](#rpc简介)
+- [项目架构构建](#项目架构构建)
+  - [基本通信过程](#基本通信过程)
+  - [Header](#header)
+  - [消息编解码](#消息编解码)
+    - [细节](#细节)
+  - [服务端](#服务端)
+    - [细节](#细节-1)
+    - [当前总结](#当前总结)
+  - [RPC Call](#rpc-call)
+  - [客户端](#客户端)
+    - [细节](#细节-2)
+    - [当前总结](#当前总结-1)
+
 # myGoRPC
 
 从零实现 Go 语言官方的标准库 net/rpc
@@ -55,14 +70,39 @@ body 的格式和长度通过 header 中的 Content-Type 和 Content-Length 指�
 | <------      固定 JSON 编码    ------>  | <-------         编码方式由 CodecType 决定          ------->|
 ```
 
+## Header
+
+- 定义请求头 Header
+  - 包含服务名、方法名、请求序列号、err
+
+```
+type Header struct {
+	Service string // 服务名
+	Method  string // 方法名
+	Seq     uint64 // 请求序列号
+	Error   string // 错误信息
+}
+```
+
 ## 消息编解码
 
-- 定义请求头 Header 
-  - 包含服务名、方法名、请求序列号、err
 - 对消息体进行编解码的接口 Codec
   - 抽象出 Codec 构造函数，客户端和服务端可以通过 Codec 的 Type 得到构造函数，从而创建 Codec 实例
-  - 定义一种 Codec - Gob 
-- GobCodec 结构体
+  - io.Closer: 关闭数据流 
+  - ReadHeader, ReadBody: 调用 gob.Decoder，从数据流中读取下一个值并写入（参数需要为相应类型的指针，nil 会丢弃数值）如果下一个值为 EOF，返回 io.EOF error 
+  - Write: 调用 gob.Encoder 一次性写入数据到 header body 中
+  - 定义一种 Codec - Gob
+
+```
+type Codec interface {
+	io.Closer
+	ReadHeader(header *Header) error
+	ReadBody(body interface{}) error
+	Write(header *Header, body interface{}) error
+}
+```
+
+- GobCodec 结构体 实现了 Codec 接口
   - conn 是由构建函数传入，通常是通过 TCP 或者 Unix 建立 socket 时得到的链接实例
   - dec 和 enc 对应 gob 的 Decoder 和 Encoder
   - buf 是为了防止阻塞而创建的带缓冲的 Writer
@@ -90,12 +130,17 @@ body 的格式和长度通过 header 中的 Content-Type 和 Content-Length 指�
 ## 服务端
 
 - 首先定义了结构体 Server，没有任何的成员字段
+
+``` 
+type Server struct{}
+```
+
 - 实现了 Accept 方式，net.Listener 作为参数，for 循环等待 socket 连接建立，并开启子协程处理，处理过程交给了 ServerConn 方法
 - ServeConn 的实现和之前讨论的通信过程紧密相关
   - 首先使用 json.NewDecoder 反序列化得到 Option 实例
   - 检查 RpcNumber 和 CodeType 的值是否正确
   - 然后根据 CodeType 得到对应的消息编解码器，接下来的处理交给 serverCodec
-- serveCodec 的过程非常简单。主要包含三个阶段 
+- serveCodec 主要包含三个阶段 
   - 读取请求 readRequest 
   - 处理请求 handleRequest 
   - 回复请求 sendResponse
@@ -144,4 +189,108 @@ body 的格式和长度通过 header 中的 Content-Type 和 Content-Length 指�
 2021/12/21 13:45:35 reply:  myGoRPC response 10003
 ```
 
+## RPC Call
 
+对于 `net/rpc` 来说，一个函数能被调用，需要满足形如 
+`func (t *T) MethodName(argType T1, replyType *T2) error` 的以下条件
+
+- the method’s type is exported. 
+- the method is exported. 
+- the method has two arguments, both exported (or builtin) types. 
+- the method’s second argument is a pointer. 
+- the method has return type error
+
+首先，需要封装结构体 Call 来承载一次 RPC 调用所需要的信息，
+为了支持异步调用，添加了一个字段 Done，
+Done 的类型是 chan *Call，当调用结束时，会调用 call.done() 通知调用方
+
+``` 
+type Call struct {
+	Seq     uint64
+	Service string
+	Method  string
+	Args    interface{}
+	Reply   interface{}
+	Error   error
+	Done    chan *Call
+}
+```
+
+## 客户端
+
+``` 
+type Client struct {
+	cc       codec.Codec      // 消息的编解码器，序列化请求，以及反序列化响应
+	option   *server.Option   // 编解码方式
+	sending  sync.Mutex       // 保证请求的有序发送，防止出现多个请求报文混淆
+	header   codec.Header     // 每个请求的消息头
+	mu       sync.Mutex       // 保护以下
+	seq      uint64           // 每个请求拥有唯一编号
+	pending  map[uint64]*Call // 存储未处理完的请求，键是编号
+	closing  bool             // 用户主动关闭的；值置为 true，则表示 Client 处于不可用的状态
+	shutdown bool             // 一般有错误发生；值置为 true，则表示 Client 处于不可用的状态
+}
+```
+
+创建 Client 实例
+
+- 首先需要完成一开始的协议交换，即发送 Option 信息给服务端
+- 协商好消息的编解码方式之后，再创建一个子协程调用 receive() 接收响应
+
+客户端先需要实现和 Call 相关的三个方法
+
+- registerCall 将参数 call 添加到 client.pending 中，并更新 client.seq
+- removeCall 根据 seq，从 client.pending 中移除对应的 call，并返回
+- terminateCalls 服务端或客户端发生错误时调用，将 shutdown 设置为 true，且将错误信息通知所有 pending 状态的 call
+
+客户端需要实现 接受请求 receive()
+
+- call 不存在，可能是请求没有发送完整，或者因为其他原因被取消，但是服务端仍旧处理了。
+- call 存在，但服务端处理出错，即 header.Error 不为空。
+- call 存在，服务端处理正常，那么需要从 body 中读取 Reply 的值
+
+还需要实现 Dial 函数，便于用户传入服务端地址，创建 Client 实例
+
+暴露给用户的 RPC 服务调用接口 Go 和 Call
+
+- Go 是一个异步接口，返回 call 实例
+- Call 是对 Go 的封装，阻塞 call.Done，等待响应返回，是一个同步接口
+
+### 细节
+
+- 可选参数 
+  - 形如 `func Printf(format string, a ...interface{})`
+  - 可变参数使用 `name ...Type` 的形式声明在函数的参数列表中，而且需要是参数列表的最后一个参数
+  - 从内部实现机理上来说，类型 `...type` 本质上是一个数组切片
+  - 使用 interface{} 传递任意类型数据，switch 语句判定类型
+
+``` 
+func MyPrintf(args ...interface{}) {
+    for _, arg := range args {
+        switch arg.(type) {
+            case int:
+                fmt.Println(arg, "is an int value.")
+            case string:
+                fmt.Println(arg, "is a string value.")
+            case int64:
+                fmt.Println(arg, "is an int64 value.")
+            default:
+                fmt.Println(arg, "is an unknown type.")
+        }
+    }
+}
+```
+
+### 当前总结
+
+```
+start rpc server on  [::]:9999
+handleRequest header:  &{Foo Func 4 } args: {myGoRPC req 2} 
+handleRequest header:  &{Foo Func 2 } args: {myGoRPC req 3} 
+handleRequest header:  &{Foo Func 3 } args: {myGoRPC req 0} 
+handleRequest header:  &{Foo Func 1 } args: {myGoRPC req 1} 
+reply:  myGoRPC response 4
+reply:  myGoRPC response 1
+reply:  myGoRPC response 2
+reply:  myGoRPC response 3
+```

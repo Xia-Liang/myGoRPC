@@ -15,14 +15,22 @@ type Header struct {
 }
 
 /*
-Codec
-定义接口，实现不同的实例
+Codec 定义接口
+
+io.Closer: 关闭数据流
+
+ReadHeader, ReadBody: 调用 gob.Decoder
+从数据流中读取下一个值，并写入（参数需要为相应类型的指针，nil 会丢弃数值）
+如果 下一个值为 EOF，返回 io.EOF error
+
+Write: 调用 gob.Encoder
+一次性写入数据到 header body 中
 */
 type Codec interface {
-	io.Closer // 关闭数据流
-	ReadHeader(*Header) error
-	ReadBody(interface{}) error
-	Write(*Header, interface{}) error
+	io.Closer
+	ReadHeader(header *Header) error
+	ReadBody(body interface{}) error
+	Write(header *Header, body interface{}) error
 }
 
 /*
