@@ -1,18 +1,3 @@
-- [myGoRPC](#mygorpc)
-- [RPC简介](#rpc简介)
-- [项目架构构建](#项目架构构建)
-  - [基本通信过程](#基本通信过程)
-  - [Header](#header)
-  - [消息编解码](#消息编解码)
-    - [细节](#细节)
-  - [服务端](#服务端)
-    - [细节](#细节-1)
-    - [当前总结](#当前总结)
-  - [RPC Call](#rpc-call)
-  - [客户端](#客户端)
-    - [细节](#细节-2)
-    - [当前总结](#当前总结-1)
-
 # myGoRPC
 
 从零实现 Go 语言官方的标准库 net/rpc
@@ -41,9 +26,7 @@ RPC解决问题
 - 注册中心
 - 负载均衡
 
-# 项目架构构建
-
-## 基本通信过程
+# 基本通信过程
 
 客户端与服务端的通信需要协商一些内容，例如 HTTP 报文，分为 header 和 body 两部分。
 body 的格式和长度通过 header 中的 Content-Type 和 Content-Length 指定，
@@ -70,7 +53,7 @@ body 的格式和长度通过 header 中的 Content-Type 和 Content-Length 指�
 | <------      固定 JSON 编码    ------>  | <-------         编码方式由 CodecType 决定          ------->|
 ```
 
-## Header
+# Header
 
 - 定义请求头 Header
   - 包含服务名、方法名、请求序列号、err
@@ -84,7 +67,7 @@ type Header struct {
 }
 ```
 
-## 消息编解码
+# 消息编解码
 
 - 对消息体进行编解码的接口 Codec
   - 抽象出 Codec 构造函数，客户端和服务端可以通过 Codec 的 Type 得到构造函数，从而创建 Codec 实例
@@ -120,14 +103,14 @@ type Codec interface {
 
 对于读则不需要这方面的考虑, 所以直接在 conn 中读内容即可
 
-### 细节
+## 细节
 
 1. 确认实现接口的所有方法
 
 - `var _ Codec = (*GobCodec)(nil)` 确认 GobCodec 类型实现了 Codec 接口的所有方法
 - 将空值转换为 *GobCodec 类型，再转换为 Codec 接口，如果转换失败，说明 GobCodec 并没有实现 Codec 接口的所有方法
 
-## 服务端
+# 服务端设计
 
 - 首先定义了结构体 Server，没有任何的成员字段
 
@@ -149,7 +132,7 @@ type Server struct{}
   - 处理请求是并发的，但是回复请求的报文必须是逐个发送的，并发容易导致多个回复报文交织在一起，客户端无法解析。在这里使用锁(sending)保证 
   - 尽力而为，只有在 header 解析失败时，才终止循环
 
-### 细节
+## 细节
 
 1. 可能的粘包问题
 
@@ -168,7 +151,7 @@ type Server struct{}
 
 - 为了避免缓冲区 c.buf.Flush() 的时候，其他goroutine也在往同一个缓冲区写入，从而导致 err: short write的错误
 
-### 当前总结
+## 当前总结
 
 我们实现了一个消息的编解码器 GobCodec，
 并且客户端与服务端实现了简单的协议交换(protocol exchange)，
@@ -189,16 +172,16 @@ type Server struct{}
 2021/12/21 13:45:35 reply:  myGoRPC response 10003
 ```
 
-## RPC Call
+# RPC Call
 
 对于 `net/rpc` 来说，一个函数能被调用，需要满足形如 
 `func (t *T) MethodName(argType T1, replyType *T2) error` 的以下条件
 
-- the method’s type is exported. 
-- the method is exported. 
-- the method has two arguments, both exported (or builtin) types. 
-- the method’s second argument is a pointer. 
-- the method has return type error
+- the method’s type is exported. – 方法所属类型是导出的。 
+- the method is exported. – 方式是导出的。 
+- the method has two arguments, both exported (or builtin) types. – 两个入参，均为导出或内置类型。 
+- the method’s second argument is a pointer. – 第二个入参必须是一个指针。 
+- the method has return type error. – 返回值为 error 类型。
 
 首先，需要封装结构体 Call 来承载一次 RPC 调用所需要的信息，
 为了支持异步调用，添加了一个字段 Done，
@@ -216,7 +199,7 @@ type Call struct {
 }
 ```
 
-## 客户端
+# 客户端设计
 
 ``` 
 type Client struct {
@@ -256,7 +239,7 @@ type Client struct {
 - Go 是一个异步接口，返回 call 实例
 - Call 是对 Go 的封装，阻塞 call.Done，等待响应返回，是一个同步接口
 
-### 细节
+## 细节
 
 - 可选参数 
   - 形如 `func Printf(format string, a ...interface{})`
@@ -281,7 +264,7 @@ func MyPrintf(args ...interface{}) {
 }
 ```
 
-### 当前总结
+## 当前总结
 
 ```
 start rpc server on  [::]:9999
@@ -293,4 +276,129 @@ reply:  myGoRPC response 4
 reply:  myGoRPC response 1
 reply:  myGoRPC response 2
 reply:  myGoRPC response 3
+```
+
+# 服务注册
+
+RPC 框架的一个基础能力是：像调用本地程序一样调用远程服务。
+对 Go 来说，这个问题就变成了如何将结构体的方法映射为服务。
+
+通过反射，我们能够非常容易地获取某个结构体的所有方法，并且能够通过方法，获取到该方法所有的参数类型与返回值
+
+例如 sync.WaitGroup ：
+
+```
+func main() {
+	var wg sync.WaitGroup
+	typ := reflect.TypeOf(&wg)
+	for i := 0; i < typ.NumMethod(); i++ {
+		method := typ.Method(i)
+		argv := make([]string, 0, method.Type.NumIn())
+		returns := make([]string, 0, method.Type.NumOut())
+		// j 从 1 开始，第 0 个入参是 wg 自己。
+		for j := 1; j < method.Type.NumIn(); j++ {
+			argv = append(argv, method.Type.In(j).Name())
+		}
+		for j := 0; j < method.Type.NumOut(); j++ {
+			returns = append(returns, method.Type.Out(j).Name())
+		}
+		log.Printf("func (w *%s) %s(%s) %s",
+			typ.Elem().Name(),
+			method.Name,
+			strings.Join(argv, ","),
+			strings.Join(returns, ","))
+    }
+}
+// 运行结果
+func (w *WaitGroup) Add(int)
+func (w *WaitGroup) Done()
+func (w *WaitGroup) Wait()
+```
+
+## 定义结构体 MethodType
+
+```
+type MethodType struct {
+	Method    reflect.Method // 方法本身
+	ArgType   reflect.Type   // 入参类型
+	ReplyType reflect.Type   // 返回类型
+	NumCall   uint64         // 统计方法调用次数
+}
+```
+
+我们还实现了 2 个方法 NewArgv 和 NewReplyv，用于创建对应类型的实例
+
+## 定义结构体 Service
+
+```
+type Service struct {
+    Name   string                 // 映射的结构体名称
+    Typ    reflect.Type           // 结构体类型
+    Rcvr   reflect.Value          // 结构体实例本身，调用时候作为第 0 个参数
+    Method map[string]*MethodType // 存储所有符合条件的方法
+}
+```
+
+完成构造函数 NewService，入参是任意需要映射为服务的结构体实例
+
+```
+func NewService(rcvr interface{}) *Service {
+	s := new(Service)
+	s.Rcvr = reflect.ValueOf(rcvr)
+	s.Name = reflect.Indirect(s.Rcvr).Type().Name()
+	s.Typ = reflect.TypeOf(rcvr)
+
+	// ast Abstract Syntax Tree, 抽象语法树
+	if !ast.IsExported(s.Name) {
+		log.Fatalf("rpc server: %s is not a valid Service Name", s.Name)
+	}
+	s.RegisterMethods()
+	return s
+}
+```
+
+RegisterMethods 过滤出了符合条件的方法：
+两个导出或内置类型的入参（反射时为 3 个，第 0 个是自身，类似于 python 的 self，java 中的 this）
+返回值有且只有 1 个，类型为 error
+
+
+还需要实现 Call 方法，即能够通过反射值调用方法
+
+## 测试用例
+
+为了保证 service 实现的正确性，为 service.go 写了几个测试用例
+
+报错原因是go test会为指定的源码文件生成一个虚拟代码包——“command-line-arguments”，而 \_test.go引用了其他包中的数据并不属于代码包“command-line-arguments”，编译不通过，因此在go test的时候加上引用的包 `go test -v service_test.go service.go`
+
+
+## 集成到服务端
+
+通过反射结构体已经映射为服务，但请求的处理过程还没有完成。从接收到请求到回复还差以下几个步骤：
+
+第一步，根据入参类型，将请求的 body 反序列化；
+
+配套实现 findService 方法，即通过 ServiceMethod 从 serviceMap 中找到对应的 service
+先在 serviceMap 中找到对应的 service 实例，
+再从 service 实例的 method 中，找到对应的 methodType
+
+补全 readRequest 方法
+通过 newArgv() 和 newReplyv() 两个方法创建出两个入参实例，然后通过 cc.ReadBody() 将请求报文反序列化为第一个入参 argv，在这里同样需要注意 argv 可能是值类型，也可能是指针类型
+
+第二步，调用 service.call，完成方法调用；
+
+handleRequest 的实现非常简单，通过 req.svc.call 完成方法调用，将 replyv 传递给 sendResponse 完成序列化即可
+
+第三步，将 reply 序列化为字节流，构造响应报文，返回。
+
+
+## 细节
+
+```
+rpc server: register Foo.Sum
+start rpc server on [::]:64244
+1 + 1 = 2
+3 + 9 = 12
+4 + 16 = 20
+2 + 4 = 6
+0 + 0 = 0
 ```
