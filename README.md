@@ -391,7 +391,7 @@ handleRequest 的实现非常简单，通过 req.svc.call 完成方法调用，�
 第三步，将 reply 序列化为字节流，构造响应报文，返回。
 
 
-## 细节
+## 当前总结
 
 ```
 rpc server: register Foo.Sum
@@ -402,3 +402,60 @@ start rpc server on [::]:64244
 2 + 4 = 6
 0 + 0 = 0
 ```
+
+# 超时处理
+
+超时处理是 RPC 框架一个比较基本的能力，如果缺少超时处理机制，无论是服务端还是客户端都容易因为网络或其他错误导致挂死，资源耗尽，这些问题的出现大大地降低了服务的可用性。
+
+纵观整个远程调用的过程，需要客户端处理超时的地方有：
+
+* 与服务端建立连接，导致的超时
+* 发送请求到服务端，写报文导致的超时
+* 等待服务端处理时，等待处理导致的超时（比如服务端已挂死，迟迟不响应）
+* 从服务端接收响应时，读报文导致的超时
+
+需要服务端处理超时的地方有：
+
+* 读取客户端请求报文时，读报文导致的超时
+* 发送响应报文时，写报文导致的超时
+* 调用映射服务的方法时，处理报文导致的超时
+
+在 3 个地方添加超时处理机制。分别是：
+
+1）客户端创建连接时  
+2）客户端 `Client.Call()` 整个过程导致的超时（包含发送报文，等待处理，接收报文所有阶段）
+3）服务端处理报文，即 `Server.handleRequest` 超时
+
+## 创建链接超时
+
+超时设定放在了 Option 中。ConnectTimeout 默认值为 10s，HandleTimeout 默认值为 0，即不设限。
+
+实现了一个超时处理的外壳 `dialTimeout`，这个壳将 NewClient 作为入参，在 2 个地方添加了超时处理的机制
+
+1. 将 `net.Dial` 替换为 `net.DialTimeout`，如果连接创建超时，将返回错误
+2. 使用子协程执行 NewClient，执行完成后则通过信道 ch 发送结果，如果 `time.After()` 信道先接收到消息，则说明 NewClient 执行超时，返回错误
+
+## Client.Call 超时
+
+使用 context 包实现，控制权交给用户，控制更为灵活
+
+可以使用 `context.WithTimeout` 创建具备超时检测能力的 context 对象来控制
+
+```
+    ctx, _ := context.WithTimeout(context.Background(), time.Second)
+    var reply int
+    err := client.Call(ctx, "Foo.Sum", &Args{1, 2}, &reply)
+```
+
+## 服务端处理超时
+
+使用 `time.After()` 结合 `select+chan` 完成
+
+这里需要确保 `sendResponse` 仅调用一次，因此将整个过程拆分为 `called` 和 `sent` 两个阶段，在这段代码中只会发生如下两种情况：
+
+1.  called 信道接收到消息，代表处理没有超时，继续执行 sendResponse。
+2.  `time.After()` 先于 called 接收到消息，说明处理已经超时，called 和 sent 都将被阻塞。在 `case <-time.After(timeout)` 处调用 `sendResponse`。
+
+## 测试
+
+连接超时、处理超时

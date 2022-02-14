@@ -1,8 +1,10 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"myGoRPC/codec"
@@ -10,6 +12,7 @@ import (
 	"net"
 	"reflect"
 	"sync"
+	"time"
 )
 
 const RpcNumber = 0x0312ff
@@ -17,15 +20,19 @@ const RpcNumber = 0x0312ff
 /*
 Option
 定义消息的编解码方式
+超时 0 即为无限制
 */
 type Option struct {
-	RpcNumber int // 标志， myGoRPC 请求
-	CodecType codec.Type
+	RpcNumber      int // 标志， myGoRPC 请求
+	CodecType      codec.Type
+	ConnectTimeout time.Duration
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
-	RpcNumber: RpcNumber,
-	CodecType: codec.GobType,
+	RpcNumber:      RpcNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 /*
@@ -83,7 +90,7 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
 		return
 	}
-	server.serveCodec(f(conn))
+	server.serveCodec(f(conn), &opt)
 }
 
 // 定义非法请求的回应
@@ -102,7 +109,7 @@ handleRequest 使用了协程并发执行请求
 
 只有在 header 解析失败时，才终止循环
 */
-func (server *Server) serveCodec(cc codec.Codec) {
+func (server *Server) serveCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
@@ -118,7 +125,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 		}
 		// 处理请求
 		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	cc.Close()
@@ -184,19 +191,52 @@ func (server *Server) sendResponse(cc codec.Codec, header *codec.Header, body in
 handleRequest
 调用相应 rpc 方法，写入 req.replyV
 而后调用 sendResponse
+
+加入超时处理
 */
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	// 应调用相应rpc方法，获取replyV，暂时只print参数
 	defer wg.Done()
+	called := make(chan struct{})
+	sent := make(chan struct{})
 
-	err := req.svc.Call(req.mtype, req.argV, req.replyV)
+	// 加上 context 告知子协程退出
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	if err != nil {
-		req.header.Error = err.Error()
-		server.sendResponse(cc, req.header, invalidRequest, sending)
+	go func(ctx context.Context) {
+		err := req.svc.Call(req.mtype, req.argV, req.replyV)
+		called <- struct{}{}
+
+		if err != nil {
+			req.header.Error = err.Error()
+			server.sendResponse(cc, req.header, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+
+		server.sendResponse(cc, req.header, req.replyV.Interface(), sending)
+		sent <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return
+		}
+	}(ctx)
+
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	server.sendResponse(cc, req.header, req.replyV.Interface(), sending)
+
+	select {
+	case <-time.After(timeout):
+		// 如果在timeout后call才调用结束，但已经超时，直接返回，将不会接受called，存在goroutines泄露
+		req.header.Error = fmt.Sprintf("rpc server: request handle timeout")
+		server.sendResponse(cc, req.header, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
 }
 
 // ------------------ 构建默认 server ----------------
