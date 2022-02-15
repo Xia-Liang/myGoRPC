@@ -1,6 +1,7 @@
-package client
+package myGoRPC
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,8 +9,9 @@ import (
 	"io"
 	"log"
 	"myGoRPC/codec"
-	"myGoRPC/server"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -35,7 +37,7 @@ func (call *Call) done() {
 
 type Client struct {
 	cc       codec.Codec      // 消息的编解码器，序列化请求，以及反序列化响应
-	option   *server.Option   // 编解码方式
+	option   *Option     // 编解码方式
 	sending  sync.Mutex       // 保证请求的有序发送，防止出现多个请求报文混淆
 	header   codec.Header     // 每个请求的消息头
 	mu       sync.Mutex       // 保护以下
@@ -119,7 +121,7 @@ NewClient
 
 创建 Client 实例；  完成协议交换；  创建子协程调用 receive 接受响应
 */
-func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
+func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		err := fmt.Errorf("invalid codec type %s ", opt.CodecType)
@@ -134,7 +136,7 @@ func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
 	return newClientCodec(f(conn), opt), nil
 }
 
-func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
+func newClientCodec(cc codec.Codec, opt *Option) *Client {
 	client := &Client{
 		seq:     1, // starts with 1, 0 invalid call
 		cc:      cc,
@@ -150,20 +152,20 @@ parseOptions
 
 ...*Option 将 Option 实现为可选参数
 */
-func parseOptions(opts ...*server.Option) (*server.Option, error) {
+func parseOptions(opts ...*Option) (*Option, error) {
 	// 校验
 	// opt is nil || pass nil as args
 	if len(opts) == 0 || opts[0] == nil {
-		return server.DefaultOption, nil
+		return DefaultOption, nil
 	}
 	if len(opts) != 1 {
 		return nil, errors.New("options are more than 1")
 	}
 
 	opt := opts[0]
-	opt.RpcNumber = server.DefaultOption.RpcNumber
+	opt.RpcNumber = DefaultOption.RpcNumber
 	if opt.CodecType == "" {
-		opt.CodecType = server.DefaultOption.CodecType
+		opt.CodecType = DefaultOption.CodecType
 	}
 	return opt, nil
 }
@@ -173,19 +175,19 @@ type clientResult struct {
 	err    error
 }
 
-type newClientFunc func(conn net.Conn, opt *server.Option) (client *Client, err error)
+type newClientFunc func(conn net.Conn, opt *Option) (client *Client, err error)
 
 /*
 dialTimeout
 
 超时处理
 */
-func dialTimeout(f newClientFunc, network, address string, opts ...*server.Option) (client *Client, err error) {
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +209,7 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*server.Optio
 	}
 	select {
 	case <-time.After(opt.ConnectTimeout):
-		// todo: 监测func未关闭，占用系统资源
+		// todo: 监测func未关闭，占用系统资源?
 		return nil, fmt.Errorf("rpc client: connection timeout")
 	case result := <-ch:
 		return result.client, result.err
@@ -219,7 +221,7 @@ Dial
 调用 net.Dial, connects to the address on the named network.
 添加外壳 dialTimeout
 */
-func Dial(network, address string, opts ...*server.Option) (client *Client, err error) {
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
 
 	return dialTimeout(NewClient, network, address, opts...)
 }
@@ -325,7 +327,49 @@ func (client *Client) Call(ctx context.Context, service, method string, args, re
 		client.removeCall(call.Seq)
 		return errors.New("rpc client: call failed: " + ctx.Err().Error())
 	case call := <-call.Done:
-			return call.Error
+		return call.Error
 	}
 	return call.Error
 }
+
+// 客户端发起 HTTP CONNECT 链接
+
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", DefaultRPCPath))
+
+	// 接受到 HTTP 响应 200 后，交换到 RPC 协议
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == Connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+/*
+XDial 简化调用，统一入口
+根据第一个参数 rpcAddr 判定 protocol@addr
+eg: http@10.0.0.1:7000, tcp@10.0.0.1:9999, unix@/tmp/myGoRPC.sock
+ */
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp, unix or other transport protocol
+		return Dial(protocol, addr, opts...)
+	}
+}
+
+

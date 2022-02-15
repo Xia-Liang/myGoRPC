@@ -1,10 +1,11 @@
-package client
+package myGoRPC
 
 import (
 	"context"
 	"fmt"
-	"myGoRPC/server"
 	"net"
+	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -25,18 +26,18 @@ func TestClient_dialTimeout(t *testing.T) {
 
 	l, _ := net.Listen("tcp", ":0")
 
-	f := func(conn net.Conn, opt *server.Option) (client *Client, err error) {
+	f := func(conn net.Conn, opt *Option) (client *Client, err error) {
 		_ = conn.Close()
 		time.Sleep(time.Second * 2)
 		return nil, nil
 	}
 
 	t.Run("timeout", func(t *testing.T) {
-		_, err := dialTimeout(f, "tcp", l.Addr().String(), &server.Option{ConnectTimeout: time.Second})
+		_, err := dialTimeout(f, "tcp", l.Addr().String(), &Option{ConnectTimeout: time.Second})
 		_assert(err != nil && strings.Contains(err.Error(), "connection timeout"), "expect a timeout error")
 	})
 	t.Run("0", func(t *testing.T) {
-		_, err := dialTimeout(f, "tcp", l.Addr().String(), &server.Option{ConnectTimeout: 0})
+		_, err := dialTimeout(f, "tcp", l.Addr().String(), &Option{ConnectTimeout: 0})
 		_assert(err == nil, "0 means no limit")
 	})
 }
@@ -56,7 +57,7 @@ func (b Bar) Timeout(argv int, reply *int) error {
 
 func startServer(addr chan string) {
 	var b Bar
-	testServer := server.NewServer()
+	testServer := NewServer()
 	_ = testServer.Register(&b)
 	// pick a free port
 	l, _ := net.Listen("tcp", ":0")
@@ -78,11 +79,31 @@ func TestClient_Call(t *testing.T) {
 		_assert(err != nil && strings.Contains(err.Error(), ctx.Err().Error()), "expect a timeout error")
 	})
 	t.Run("server handle timeout", func(t *testing.T) {
-		client, _ := Dial("tcp", addr, &server.Option{
+		client, _ := Dial("tcp", addr, &Option{
 			HandleTimeout: time.Second,
 		})
 		var reply int
 		err := client.Call(context.Background(), "Bar", "Timeout", 1, &reply)
 		_assert(err != nil && strings.Contains(err.Error(), "handle timeout"), "expect a timeout error")
 	})
+}
+
+func TestXDail(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		ch := make(chan struct{})
+		addr := "/tmp/myGoRPC.sock"
+		go func() {
+			_ = os.Remove(addr)
+			l, err := net.Listen("unix", addr)
+			if err != nil {
+				t.Fatal("failed to listen unix socket")
+			}
+			ch <- struct{}{}
+			testServer := NewServer()
+			testServer.Accept(l)
+		}()
+		<-ch
+		_, err := XDial("unix@" + addr)
+		_assert(err == nil, "failed to connect unix socket")
+	}
 }

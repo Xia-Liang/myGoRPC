@@ -459,3 +459,81 @@ start rpc server on [::]:64244
 ## 测试
 
 连接超时、处理超时
+
+
+# 支持HTTP协议
+
+由于RPC消息格式与HTTP标准协议并不兼容，需要协议转换过程。HTTP协议中的CONNECT方法提供了代理服务。
+
+假设浏览器与服务器之间的 HTTPS 通信都是加密的，浏览器通过代理服务器发起 HTTPS 请求时，由于请求的站点地址和端口号都是加密保存在 HTTPS 请求报文头中的，代理服务器如何知道往哪里发送请求呢？
+
+为了解决这个问题，浏览器通过 HTTP 明文形式向代理服务器发送一个 CONNECT 请求告诉代理服务器目标地址和端口，代理服务器接收到这个请求后，会在对应端口与目标站点建立一个 TCP 连接，连接建立成功后返回 HTTP 200 状态码告诉浏览器与该站点的加密通道已经完成。接下来代理服务器仅需透传浏览器和服务器之间的加密数据包即可，代理服务器无需解析 HTTPS 报文。
+
+这个过程其实是通过代理服务器将 HTTP 协议转换为 HTTPS 协议的过程。
+
+- 对RPC服务端来说，需要将HTTP协议转换为RPC协议
+- 对客户端来说，需要新增通过 HTTP CONNECT 请求创建连接的逻辑
+
+## 支持HTTP协议的通信过程
+
+1.  客户端向 RPC 服务器发送 CONNECT 请求
+
+```
+    CONNECT 10.0.0.1:9999/_geerpc_ HTTP/1.0
+```
+
+2. RPC 服务器返回 HTTP 200 状态码表示连接建立
+
+```
+    HTTP/1.0 200 Connected to Gee RPC
+```
+
+3. 客户端使用创建好的连接发送 RPC 报文，先发送 Option，再发送 N 个请求报文，服务端处理 RPC 请求并响应
+
+## 服务端接受CONNECT请求
+
+## 客户端发起CONNECT请求
+
+## 实现简单的debug界面
+
+支持 HTTP 协议的好处在于，RPC 服务仅仅使用了监听端口的 `/myGoRPC` 路径，在其他路径上我们可以提供诸如日志、统计等更为丰富的功能。接下来我们在 `/debug/myGoRPC` 上展示服务的调用统计视图。
+
+## 细节
+
+import cycle
+
+An import cycle indicates a fundamentally faulty design.
+
+- You're mixing concerns.
+- You're relying on a concretion where you should be relying on an interface and injecting a concretion.
+- You need one or more additional, separate packages
+
+## 当前总结
+
+启动，在最后调用 `startServer`，服务启动后将一直等待。
+
+运行结果如下
+
+```
+Xia@sakuraMacAir main % go run .
+rpc server: register Foo.Sum
+rpc server debug path: /debug/myGoRPC
+0 + 0 = 0
+4 + 16 = 20
+3 + 9 = 12
+1 + 1 = 2
+2 + 4 = 6
+```
+
+进入
+http://localhost:9999/debug/myGoRPC
+
+```
+Service Foo
+
+---
+
+| Method | Calls |
+| --- | --- |
+| Sum(main.Args, *int) error | 5   |
+```

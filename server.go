@@ -1,7 +1,6 @@
-package server
+package myGoRPC
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 	"myGoRPC/codec"
 	"myGoRPC/service"
 	"net"
+	"net/http"
 	"reflect"
 	"sync"
 	"time"
@@ -40,7 +40,7 @@ Server
 定义了 RPC server
 */
 type Server struct {
-	serviceMap sync.Map
+	ServiceMap sync.Map
 }
 
 func NewServer() *Server {
@@ -200,11 +200,30 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 	called := make(chan struct{})
 	sent := make(chan struct{})
 
-	// 加上 context 告知子协程退出
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	//// 加上 context 告知子协程退出
+	//ctx, cancel := context.WithCancel(context.Background())
+	//defer cancel()
+	//
+	//go func(ctx context.Context) {
+	//	err := req.svc.Call(req.mtype, req.argV, req.replyV)
+	//	called <- struct{}{}
+	//
+	//	if err != nil {
+	//		req.header.Error = err.Error()
+	//		server.sendResponse(cc, req.header, invalidRequest, sending)
+	//		sent <- struct{}{}
+	//		return
+	//	}
+	//
+	//	server.sendResponse(cc, req.header, req.replyV.Interface(), sending)
+	//	sent <- struct{}{}
+	//	select {
+	//	case <-ctx.Done():
+	//		return
+	//	}
+	//}(ctx)
 
-	go func(ctx context.Context) {
+	go func() {
 		err := req.svc.Call(req.mtype, req.argV, req.replyV)
 		called <- struct{}{}
 
@@ -217,11 +236,7 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 
 		server.sendResponse(cc, req.header, req.replyV.Interface(), sending)
 		sent <- struct{}{}
-		select {
-		case <-ctx.Done():
-			return
-		}
-	}(ctx)
+	}()
 
 	if timeout == 0 {
 		<-called
@@ -249,7 +264,7 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 
 func (server *Server) Register(rcvr interface{}) error {
 	s := service.NewService(rcvr)
-	if _, dup := server.serviceMap.LoadOrStore(s.Name, s); dup {
+	if _, dup := server.ServiceMap.LoadOrStore(s.Name, s); dup {
 		return errors.New("rpc: service already defined: " + s.Name)
 	}
 	return nil
@@ -261,7 +276,7 @@ func (server *Server) findServiceMethod(serviceName, methodName string) (svc *se
 		return
 	}
 
-	svci, ok := server.serviceMap.Load(serviceName)
+	svci, ok := server.ServiceMap.Load(serviceName)
 
 	if !ok {
 		err = errors.New("rpc server: can't find service " + serviceName)
@@ -274,4 +289,36 @@ func (server *Server) findServiceMethod(serviceName, methodName string) (svc *se
 		err = errors.New("rpc server: can't find method" + methodName)
 	}
 	return
+}
+
+// 服务端接受 HTTP CONNECT 链接
+
+const (
+	Connected        = "200 Connected to myGoRPC"
+	DefaultRPCPath   = "/myGoRPC"
+	DefaultDebugPath = "/debug/myGoRPC"
+)
+
+// ServeHTTP 实现了 http.Handler 响应 RPC 请求
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT \n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+Connected+"\n\n")
+	server.ServeConn(conn)
+}
+
+// HandleHTTP 注册了 DefaultRPCPath 路径的 HTTP handler
+func (server *Server) HandleHTTP() {
+	http.Handle(DefaultRPCPath, server)
+	http.Handle(DefaultDebugPath, DebugHTTP{server})
+	log.Println("rpc server debug path:", DefaultDebugPath)
 }
