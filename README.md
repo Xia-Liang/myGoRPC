@@ -537,3 +537,131 @@ Service Foo
 | --- | --- |
 | Sum(main.Args, *int) error | 5   |
 ```
+
+# 负载均衡
+
+假设有多个服务实例，每个实例提供相同的功能，为了提高整个系统的吞吐量，每个实例部署在不同的机器上。客户端可以选择任意一个实例进行调用，获取想要的结果。那如何选择呢？取决了负载均衡的策略。
+
+* 随机选择策略 \- 从服务列表中随机选择一个。
+* 轮询算法(Round Robin) - 依次调度不同的服务器，每次调度执行 i = (i + 1) mod n。
+* 加权轮询(Weight Round Robin) - 在轮询算法的基础上，为每个服务实例设置一个权重，高性能的机器赋予更高的权重，也可以根据服务实例的当前的负载情况做动态的调整，例如考虑最近5分钟部署服务器的 CPU、内存消耗情况。
+* 哈希/一致性哈希策略 \- 依据请求的某些特征，计算一个 hash 值，根据 hash 值将请求发送到对应的机器。一致性 hash 还可以解决服务实例动态添加情况下，调度抖动的问题。一致性哈希的一个典型应用场景是分布式缓存服务。
+* …
+
+## 服务发现
+
+与通信部分解耦，这部分的代码统一放置在 xclient 子目录下
+
+* SelectMode 代表不同的负载均衡策略，简单起见，GeeRPC 仅实现 Random 和 RoundRobin 两种策略
+* Discovery 是一个接口类型，包含了服务发现所需要的最基本的接口。
+    * `Refresh()` 从注册中心更新服务列表
+    * `Update(servers []string)` 手动更新服务列表
+    * `Get(mode SelectMode)` 根据负载均衡策略，选择一个服务实例
+    * `GetAll()` 返回所有的服务实例
+
+```
+const (
+	RandomSelect SelectMode = iota
+	RoundRobinSelect
+)
+
+type Discovery interface {
+	Refresh() error                      // 从注册中心更新服务列表
+	Update(servers []string) error       // 手动更新服务列表
+	Get(mode SelectMode) (string, error) // 根据负载均衡策略，选择一个服务实例
+	GetAll() ([]string, error)           // 返回所有服务实例
+}
+```
+
+## 支持负载均衡的客户端 XClient
+
+向用户暴露一个支持负载均衡的客户端 XClient
+
+```
+type XClient struct {
+	d       Discovery
+	mode    SelectMode
+	opt     *myGoRPC.Option
+	mu      sync.Mutex
+	clients map[string]*myGoRPC.Client
+}
+
+var _ io.Closer = (*XClient)(nil)
+
+func NewXClient(d Discovery, mode SelectMode, opt *myGoRPC.Option) *XClient {
+	return &XClient{
+		d:       d,
+		mode:    mode,
+		opt:     opt,
+		clients: make(map[string]*myGoRPC.Client),
+	}
+}
+```
+
+XClient 的构造函数需要传入三个参数，服务发现实例 Discovery、负载均衡模式 SelectMode 以及协议选项 Option。
+
+为了尽量地复用已经创建好的 Socket 连接，使用 clients 保存创建成功的 Client 实例，并提供 Close 方法在结束后，关闭已经建立的连接
+
+```
+func (xc *XClient) dial(rpcAddr string) (*myGoRPC.Client, error) {
+	xc.mu.Lock()
+	defer xc.mu.Unlock()
+	client, ok := xc.clients[rpcAddr]
+	if ok && !client.IsAvailable() {
+		_ = client.Close()
+		delete(xc.clients, rpcAddr)
+		client = nil
+	}
+	if client == nil {
+		var err error
+		client, err = myGoRPC.XDial(rpcAddr, xc.opt)
+		if err != nil {
+			return nil, err
+		}
+		xc.clients[rpcAddr] = client
+	}
+	return client, nil
+}
+```
+
+将复用 Client 的能力封装在方法 `dial` 中，dial 的处理逻辑如下：
+
+1.  检查 `xc.clients` 是否有缓存的 Client，如果有，检查是否是可用状态，如果是则返回缓存的 Client，如果不可用，则从缓存中删除。
+2.  如果步骤 1) 没有返回缓存的 Client，则说明需要创建新的 Client，缓存并返回。
+
+## Broadcast
+
+Broadcast 将请求广播到所有的服务实例，如果任意一个实例发生错误，则返回其中一个错误；如果调用成功，则返回其中一个的结果。有以下几点需要注意：
+
+1.  为了提升性能，请求是并发的。
+2.  并发情况下需要使用互斥锁保证 error 和 reply 能被正确赋值。
+3.  借助 context.WithCancel 确保有错误发生时，快速失败。
+
+## 当前总结
+
+当前demo输出
+
+```
+rpc server: register Foo.Sleep
+rpc server: register Foo.Sum
+rpc server: register Foo.Sleep
+rpc server: register Foo.Sum
+call Foo Sum success: 3 + 9 = 12
+call Foo Sum success: 4 + 16 = 20
+call Foo Sum success: 0 + 0 = 0
+call Foo Sum success: 1 + 1 = 2
+call Foo Sum success: 2 + 4 = 6
+broadcast Foo Sum success: 2 + 4 = 6
+broadcast Foo Sum success: 4 + 16 = 20
+broadcast Foo Sum success: 3 + 9 = 12
+broadcast Foo Sum success: 0 + 0 = 0
+broadcast Foo Sum success: 1 + 1 = 2
+broadcast Foo Sleep success: 0 + 0 = 0
+broadcast Foo Sleep success: 1 + 1 = 2
+broadcast Foo Sleep error: rpc client: call failed: context deadline exceeded
+broadcast Foo Sleep error: rpc client: call failed: context deadline exceeded
+broadcast Foo Sleep error: rpc client: call failed: context deadline exceeded
+```
+
+注意 reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem()) 细节
+
