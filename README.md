@@ -1,11 +1,12 @@
+
+
 # myGoRPC
 
-从零实现 Go 语言官方的标准库 net/rpc
+实现 Go 语言官方的标准库 net/rpc
 
 # RPC简介
 
-RPC(Remote Procedure Call)，是一种计算机通信协议，允许调用不同进程空间的程序，
-客户端和服务器可以在相同机器上，也可以在不同机器上，程序调用时无需关注内部实现的细节。
+RPC(Remote Procedure Call)，是一种计算机通信协议，允许调用不同进程空间的程序，客户端和服务器可以在相同机器上，也可以在不同机器上，程序调用时无需关注内部实现的细节。
 
 基于 HTTP 协议的 Restful API 更通用，但是有以下缺点
 
@@ -28,10 +29,11 @@ RPC解决问题
 
 # 基本通信过程
 
-客户端与服务端的通信需要协商一些内容，例如 HTTP 报文，分为 header 和 body 两部分。
-body 的格式和长度通过 header 中的 Content-Type 和 Content-Length 指定，
-服务端通过解析 header 就能够知道如何从 body 中读取需要的信息。
-对于 RPC 协议来说，这部分协商是需要自主设计的。
+客户端与服务端的通信需要协商内容，例如 HTTP 报文，分为 header 和 body 两部分。
+
+body 的格式和长度通过 header 中的 Content-Type 和 Content-Length 指定，服务端通过解析 header 就能够知道如何从 body 中读取需要的信息。
+
+对于 RPC 协议来说，这部分协商需要自主设计的。
 
 - 消息的编解码方式
   - 定义 Option 结构体
@@ -664,4 +666,117 @@ broadcast Foo Sleep error: rpc client: call failed: context deadline exceeded
 ```
 
 注意 reflect.ValueOf(reply).Elem().Set(reflect.ValueOf(clonedReply).Elem()) 细节
+
+注意
+
+day6和day7代码在跑的时候有几率出现以下错误 - tcp粘包？
+
+```
+> rpc server: read header error: gob: unknown type id or corrupted data  
+> call Foo.Sum error: read tcp \[::1\]:57188->\[::1\]:40693: read: connection reset by peer
+```
+
+# 注册中心
+
+注册中心的好处在于，客户端和服务端都只需要感知注册中心的存在，而无需感知对方的存在。
+
+1.  服务端启动后，向注册中心发送注册消息，注册中心得知该服务已经启动，处于可用状态。一般来说，服务端还需要定期向注册中心发送心跳，证明存活。
+2.  客户端向注册中心询问，当前哪天服务是可用的，注册中心将可用的服务列表返回客户端。
+3.  客户端根据注册中心得到的服务列表，选择其中一个发起调用。
+
+## 简易心跳保活的注册中心
+
+首先定义 GoRegistry 结构体，默认超时时间 5 分钟
+
+```
+type GoRegistry struct {
+	timeout time.Duration
+	mu      sync.Mutex
+	servers map[string]*ServerItem
+}
+
+type ServerItem struct {
+	Addr  string
+	start time.Time
+}
+```
+
+- `putSerer` 添加服务实例，如果已经存在则更新启动时间 start
+- `aliveServers` 返回可用的服务列表，同时删除超时服务
+
+采用 HTTP 协议提供服务，有用信息承载在 HTTP Header 中
+
+- Get：返回所有可用的服务列表
+- Post：添加服务实例或发送心跳
+
+服务启动时、启动后定期发送心跳
+
+```
+func Heartbeat(registry, addr string, duration time.Duration) {
+	if duration == 0 {
+		duration = defaultTimeout - time.Duration(1)*time.Minute
+	}
+
+	var err error
+	err = sendHeartbeat(registry, addr)
+	go func() {
+		t := time.NewTicker(duration)
+		for err == nil {
+			<-t.C
+			err = sendHeartbeat(registry, addr)
+		}
+	}()
+}
+```
+
+## 封装Discovery
+
+```
+/*
+GoRegistryDiscovery
+嵌套了 MultiServersDiscovery，复用
+registry 注册中心的地址
+timeout 服务列表的过期时间
+lastUpdate 是代表最后从注册中心更新服务列表的时间，默认 10s 过期，即 10s 之后，需要从注册中心更新新的列表
+*/
+type GoRegistryDiscovery struct {
+	*MultiServerDiscovery
+	registry   string
+	timeout    time.Duration
+	lastUpdate time.Time
+}
+```
+
+- `Upadte` 更新注册中心，重设 lastUpdate等字段
+- `Refresh` 超时重新获取
+- 
+
+## 当前总结
+
+```
+rpc registry path:  /mygorpc/registry
+rpc server: register Foo.Sleep
+rpc server: register Foo.Sum
+rpc server: register Foo.Sleep
+rpc server: register Foo.Sum
+tcp@[::]:52752  send heart beat to registry  http://localhost:9999/mygorpc/registry
+tcp@[::]:52751  send heart beat to registry  http://localhost:9999/mygorpc/registry
+rpc registry: refresh servers from registry  http://localhost:9999/mygorpc/registry
+call Foo Sum success: 1 + 1 = 2
+call Foo Sum success: 3 + 9 = 12
+call Foo Sum success: 4 + 16 = 20
+call Foo Sum success: 2 + 4 = 6
+call Foo Sum success: 0 + 0 = 0
+rpc registry: refresh servers from registry  http://localhost:9999/mygorpc/registry
+broadcast Foo Sum success: 3 + 9 = 12
+broadcast Foo Sum success: 2 + 4 = 6
+broadcast Foo Sum success: 1 + 1 = 2
+broadcast Foo Sum success: 0 + 0 = 0
+broadcast Foo Sum success: 4 + 16 = 20
+broadcast Foo Sleep success: 0 + 0 = 0
+broadcast Foo Sleep success: 1 + 1 = 2
+broadcast Foo Sleep error: rpc client: call failed: context deadline exceeded
+broadcast Foo Sleep error: rpc client: call failed: context deadline exceeded
+broadcast Foo Sleep error: rpc client: call failed: context deadline exceeded
+```
 

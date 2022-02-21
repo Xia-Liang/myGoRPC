@@ -4,30 +4,37 @@ import (
 	"context"
 	"log"
 	"myGoRPC"
+	"myGoRPC/registry"
 	"myGoRPC/xclient"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 )
 
 func main() {
 	log.SetFlags(0)
-	ch1 := make(chan string)
-	ch2 := make(chan string)
-	// start two servers
-	go startServerDay6(ch1)
-	go startServerDay6(ch2)
 
-	addr1 := <-ch1
-	addr2 := <-ch2
+	registryAddr := "http://localhost:9999/mygorpc/registry"
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go startRegistry(&wg)
+	wg.Wait()
 
 	time.Sleep(time.Second)
-	callDay6(addr1, addr2)
+	wg.Add(2)
+	go startServerDay7(registryAddr, &wg)
+	go startServerDay7(registryAddr, &wg)
+	wg.Wait()
+
 	time.Sleep(time.Second)
-	broadcastDay6(addr1, addr2)
+	callDay7(registryAddr)
+	time.Sleep(time.Second)
+	broadcastDay7(registryAddr)
 }
 
-// ---------------- day 6 -----------------------------------
+// ---------------- day 7 -----------------------------------
 
 type Foo int
 
@@ -44,16 +51,21 @@ func (f Foo) Sleep(args Args, reply *int) error {
 	return nil
 }
 
-func startServerDay6(addr chan string) {
+func startRegistry(wg *sync.WaitGroup) {
+	l, _ := net.Listen("tcp", ":9999")
+	registry.HandleHTTP()
+	wg.Done()
+	_ = http.Serve(l, nil)
+}
+
+func startServerDay7(registryAddr string, wg *sync.WaitGroup) {
 	var foo Foo
-	newServer := myGoRPC.NewServer()
-	newServer.Register(&foo)
-
 	l, _ := net.Listen("tcp", ":0")
-
-	addr <- l.Addr().String()
-
-	newServer.Accept(l)
+	server := myGoRPC.NewServer()
+	_ = server.Register(&foo)
+	registry.Heartbeat(registryAddr, "tcp@"+l.Addr().String(), 0)
+	wg.Done()
+	server.Accept(l)
 }
 
 // 封装一个方法 foo，便于在 Call 或 Broadcast 之后统一打印成功或失败的日志
@@ -74,8 +86,8 @@ func foo(xc *xclient.XClient, ctx context.Context, typ, service, method string, 
 }
 
 // call 调用单个服务实例
-func callDay6(addr1, addr2 string) {
-	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+func callDay7(registry string) {
+	d := xclient.NewGoRegistryDiscovery(registry, 0)
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 	defer func() { _ = xc.Close() }()
 	// send request & receive response
@@ -92,8 +104,8 @@ func callDay6(addr1, addr2 string) {
 
 
 // broadcast 调用所有服务实例
-func broadcastDay6(addr1, addr2 string) {
-	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+func broadcastDay7(registry string) {
+	d := xclient.NewGoRegistryDiscovery(registry, 0)
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 	defer func() { _ = xc.Close() }()
 	var wg sync.WaitGroup
